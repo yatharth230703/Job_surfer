@@ -1,0 +1,25 @@
+.env
+.DS_Store
+__pycache__/
+.venv/
+
+# browser profile copy (holds LinkedIn login cookies)
+chrome_data/
+
+# run output and data
+debug/
+*.log
+*.xlsx
+*.csv
+
+# documents and images
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+
+# notes and research docs (not code)
+*.md
+*.txt
