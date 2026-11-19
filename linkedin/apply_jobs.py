@@ -6,15 +6,21 @@
 Searches every query in SEARCH_QUERIES twice: Delhi NCR (any workplace type) and worldwide remote.
 Only Easy Apply jobs posted in the past week whose title passes the keyword bank are opened.
 Forms: years of experience -> 1, every Yes/No -> Yes, current CTC 0, notice 0, expected CTC 3.5 LPA.
-Any question the answer bank can't handle -> application discarded, question logged to unanswered_questions.csv.
+Any question the rules can't handle -> application discarded, question added to ../question_bank.xlsx.
+Fill in its answer there and every bot (LinkedIn, Wellfound, Naukri) uses it from then on.
 """
 import argparse
+import base64
+import contextlib
 import csv
+import fcntl
+import json
 import os
 import random
 import re
 import time
 import urllib.parse as up
+import urllib.request
 from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
@@ -36,7 +42,7 @@ def env(key):
 
 PHONE = env("PHONE")  # no phone set -> phone questions count as unknown and the application is skipped
 APPLIED_LOG = HERE / "applied_log.csv"
-UNANSWERED_LOG = HERE / "unanswered_questions.csv"
+QUESTION_BANK = HERE.parent / "question_bank.xlsx"  # shared by all bots; Soumya fills the answer column by hand
 JOBS_XLSX = HERE / "applied_jobs.xlsx"  # one row per submitted application, with the full description
 EXTERNAL_XLSX = HERE / "external_jobs.xlsx"  # matching jobs without Easy Apply, to apply to by hand
 DAILY_LIMIT = re.compile(r"reached (the |today.s )?(daily )?(Easy Apply|application) limit", re.I)
@@ -158,8 +164,223 @@ def location_ok(loc, mode):
 
 
 # ---------------- answer bank ----------------
-def answer(q, kind, opts=()):
-    """Return the answer for a form question, or None if we don't know it."""
+# ---------------- question bank (question_bank.xlsx) ----------------
+BANK_COLS = [("Question", 70), ("Answer (fill in)", 40), ("Type", 10), ("Options", 50), ("Site", 10),
+             ("Times seen", 11), ("Last seen", 17), ("Example job", 50), ("Answered by", 12)]
+AI_SHEET = "AI per-job answers"  # job-specific AI answers: logged for review, never reused
+AI_COLS = [("Time", 17), ("Site", 10), ("Job", 40), ("Question", 60), ("Answer", 80), ("Job URL", 50)]
+_bank = {"mtime": None, "answers": {}}
+
+
+def norm_q(q):
+    """Same question despite '*', '0/20' counters, punctuation, case or spacing."""
+    q = re.sub(r"\d+\s*(/|of)\s*\d+(\s*characters)?\s*$", "", q.strip(), flags=re.I)
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", q.lower()).split())
+
+
+def _bank_answers():
+    """{normalised question: answer} for filled-in rows; re-read whenever the file changes (edit it mid-run)."""
+    try:
+        mtime = QUESTION_BANK.stat().st_mtime
+    except FileNotFoundError:
+        return {}
+    if mtime != _bank["mtime"]:
+        from openpyxl import load_workbook
+        try:
+            rows = load_workbook(QUESTION_BANK, read_only=True).worksheets[0].iter_rows(min_row=2, max_col=2, values_only=True)
+            _bank["answers"] = {norm_q(str(q)): str(a).strip() for q, a in rows if q and a is not None and str(a).strip()}
+            _bank["mtime"] = mtime
+        except Exception as e:  # half-saved / locked file: keep the last good copy
+            print(f"     (couldn't read {QUESTION_BANK.name}: {e})")
+    return _bank["answers"]
+
+
+def bank_answer(q, opts=()):
+    """The hand-written answer for q, matched to one of opts when the field has options."""
+    a = _bank_answers().get(norm_q(q))
+    if a is None or not opts:
+        return a
+    low = [o.lower().strip() for o in opts]
+    if a.lower() in low:
+        return opts[low.index(a.lower())]
+    starts = [o for o, l in zip(opts, low) if re.match(re.escape(a.lower()) + r"(?![a-z0-9])", l)]  # "1" -> "1 year", not "10"
+    return starts[0] if len(starts) == 1 else None  # answer doesn't fit these options -> treated as unknown
+
+
+@contextlib.contextmanager
+def _bank_lock():
+    """Bots run in parallel (LinkedIn + Naukri): serialise load-modify-save so no row is lost."""
+    with open(QUESTION_BANK.with_suffix(".lock"), "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def _sheet(wb, title, cols):
+    from openpyxl.styles import Font
+    ws = wb[title] if title in wb.sheetnames else wb.create_sheet(title)
+    ws.freeze_panes = "A2"
+    for i, (c, w) in enumerate(cols, 1):  # also adds columns introduced later (e.g. "Answered by")
+        if not ws.cell(1, i).value:
+            ws.cell(1, i).value = c
+        ws.cell(1, i).font = Font(bold=True)
+        ws.column_dimensions[ws.cell(1, i).column_letter].width = w
+    return ws
+
+
+def bank_record(q, kind, opts=(), site="", job_url="", answer=None, source=""):
+    """Add a question to the bank (blank answer = for Soumya to fill), or bump its count if it's already there."""
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Alignment, Font
+    opts = " | ".join(o for o in opts if o and not re.match(r"select( an)? option", o, re.I))
+    now = time.strftime("%Y-%m-%d %H:%M")
+    try:
+        with _bank_lock():
+            if QUESTION_BANK.exists():
+                wb = load_workbook(QUESTION_BANK)
+            else:
+                wb = Workbook(); wb.active.title = "Questions"
+            ws = _sheet(wb, wb.worksheets[0].title, BANK_COLS)
+            key = norm_q(q)
+            for row in ws.iter_rows(min_row=2):
+                if row[0].value and norm_q(str(row[0].value)) == key:
+                    row[5].value = (row[5].value or 0) + 1
+                    row[6].value = now
+                    if opts and not row[3].value:
+                        row[3].value = opts
+                    if answer and not row[1].value:
+                        ws.cell(row[0].row, 2).value = answer
+                        ws.cell(row[0].row, 9).value = source
+                    break
+            else:
+                ws.append([q.strip(), answer, kind, opts, site, 1, now, job_url, source or None])
+                for c in ws[ws.max_row]:
+                    c.alignment = Alignment(wrap_text=True, vertical="top")
+            wb.save(QUESTION_BANK)
+    except Exception as e:  # e.g. file locked; never kill a run over the spreadsheet
+        print(f"     (couldn't write {QUESTION_BANK.name}: {e})")
+
+
+# ---------------- Gemini: first sight of a question the bank and rules can't answer ----------------
+GEMINI_MODELS = ("gemini-2.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest")
+CREDENTIAL = re.compile(r"certifi|licen[cs]|registered (with|pharmacist|nurse)|membership|member id", re.I)
+# Asking applicants to pay is a classic scam: never answered, so LinkedIn discards the form and it lands in the bank.
+FEE = re.compile(r"\b(fees?|deposit|refundable|registration (charge|amount)|security (amount|money)|training charges?"
+                 r"|pay (an?|the|any|some) (amount|fee|charge))\b", re.I)
+_cooldown = {}  # model -> time it returned 429; skipped for 10 min instead of waiting on it every question
+AI_PROMPT = """You are filling in a job application form for the candidate whose resume is attached.
+Job: {title} at {company}
+Job description:
+{desc}
+
+Form question: {q}
+Field type: {kind}
+{opts}
+Rules:
+- Facts (degrees, certifications, licences, tools, skills, employers, sales or revenue numbers, years of experience in a
+  specific skill) come ONLY from the resume. If the resume doesn't show it, answer honestly negative ("No", "0", or the
+  lowest option). Never invent experience, credentials or numbers. Years in a specific skill: "1" if the resume shows
+  internship or project work in it, else "0".
+- The job description describes the employer, never the candidate. The candidate has no sales history: questions about
+  what she sells, her clients, revenue, targets, deals or accounts managed get "None", "0", the lowest option or a
+  "not applicable / skip" option. Never copy such facts from the job description.
+- You may infer obvious facts from the resume (e.g. the state from the city).
+- Preferences and availability (relocation, shifts, travel, field work, working days, commute, joining date, staying on
+  after an internship): the candidate is flexible -> "Yes" or the most flexible option.
+- Personal details the resume doesn't give and you can't infer (gender, date of birth, ID or member numbers, links,
+  references, reasons for gaps): answer null.
+- With options, the answer must be exactly one of the option texts. A number question ("how many", "rate out of 10")
+  gets digits only. Short factual questions get a few words. Open questions ("why", "describe", "tell us") get a first-
+  person answer of 50-100 words (or the length the question asks for): plain text, no greeting, no placeholders.
+- job_specific is true when the answer mentions or depends on this company or role, false when the same answer would
+  fit any job.
+Reply as JSON: {{"answer": string or null, "job_specific": true or false}}"""
+
+
+def gemini_json(prompt, pdf):
+    """Gemini with the resume PDF inline; returns the parsed JSON reply, or None if every model failed."""
+    key = env("GEMINI_API_KEY")
+    if not key:
+        return None
+    body = {"contents": [{"parts": [{"inline_data": {"mime_type": "application/pdf",
+                                                     "data": base64.b64encode(pdf.read_bytes()).decode()}},
+                                    {"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json"}}
+    for attempt in range(2):
+        for model in GEMINI_MODELS:  # 503 "high demand" is common; fall through to the next model
+            if time.time() - _cooldown.get(model, 0) < 600:
+                continue
+            req = urllib.request.Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "x-goog-api-key": key})
+            try:
+                with urllib.request.urlopen(req, timeout=40) as r:
+                    parts = json.load(r)["candidates"][0]["content"]["parts"]
+                return json.loads("".join(p.get("text", "") for p in parts if not p.get("thought")))
+            except Exception as e:
+                if getattr(e, "code", None) == 429:
+                    _cooldown[model] = time.time()
+                print(f"     gemini {model} failed: {str(e)[:80]}")
+        time.sleep(15)
+    return None
+
+
+def ai_answer(q, kind, opts, job):
+    """Ask Gemini once; generic answers go into the bank (reused without AI), job-specific ones only to the AI sheet."""
+    choices = [o for o in opts if o and not re.match(r"select( an)? option", o, re.I)]
+    reply = gemini_json(AI_PROMPT.format(
+        title=job.get("title", ""), company=job.get("company", ""), desc=(job.get("desc") or "")[:6000], q=q, kind=kind,
+        opts=("Options: " + " | ".join(choices) + "\n") if choices else ""), HERE.parent / resume_for(job.get("title", "")))
+    a = str((reply or {}).get("answer") or "").strip()
+    if not a or a.lower() in ("null", "none"):
+        return None
+    if choices:
+        low = [o.lower().strip() for o in choices]
+        if a.lower() not in low:
+            return None
+        a = choices[low.index(a.lower())]
+    if CREDENTIAL.search(q) and re.match(r"yes\b", a, re.I):
+        return None  # second check: never claim a credential, even if the model does
+    print(f"     [gemini{' per-job' if reply.get('job_specific') else ''}] {q[:60]!r} -> {a[:70]!r}")
+    if reply.get("job_specific"):
+        _ai_log(job, q, a)
+    else:
+        bank_record(q, kind, opts, job.get("site", ""), job.get("url", ""), answer=a, source="Gemini")
+    return a
+
+
+def _ai_log(job, q, a):
+    from openpyxl import Workbook, load_workbook
+    try:
+        with _bank_lock():
+            wb = load_workbook(QUESTION_BANK) if QUESTION_BANK.exists() else Workbook()
+            if not QUESTION_BANK.exists():
+                wb.active.title = "Questions"
+                _sheet(wb, "Questions", BANK_COLS)
+            _sheet(wb, AI_SHEET, AI_COLS).append([time.strftime("%Y-%m-%d %H:%M"), job.get("site", ""),
+                                                 f"{job.get('title', '')} @ {job.get('company', '')}", q, a, job.get("url", "")])
+            wb.save(QUESTION_BANK)
+    except Exception as e:
+        print(f"     (couldn't write {QUESTION_BANK.name}: {e})")
+
+
+def smart_answer(q, kind, opts=(), job=None):
+    """Bank -> fixed rules (salary, notice, phone, city, languages, total experience) -> Gemini on first sight.
+    The blanket "every Yes/No -> Yes" and "1 year in any skill" rules are off here: Gemini answers those from the resume."""
+    a = answer(q, kind, opts, blanket=False)
+    if a is None and FEE.search(q):
+        print(f"     !! asks the applicant to pay money, left unanswered: {q[:80]!r}")
+        return None
+    if a is None and job is not None:
+        a = ai_answer(q, kind, opts, job)
+    return a
+
+
+def answer(q, kind, opts=(), blanket=True):
+    """Return the answer for a form question, or None if we don't know it. Hand-written bank answers win.
+    blanket=False drops the guesses (Yes to every Yes/No, 1 year in any skill) so the caller can ask Gemini instead."""
+    banked = bank_answer(q, opts)
+    if banked is not None:
+        return banked
     ql = q.lower()
     opt_l = [o.lower() for o in opts]
 
@@ -186,7 +407,7 @@ def answer(q, kind, opts=()):
         if re.search(r"month", ql):
             return "29000"
         return "350000"
-    if kind in ("select", "radio") and "yes" in opt_l:
+    if blanket and kind in ("select", "radio") and "yes" in opt_l:
         return opts[opt_l.index("yes")]  # every Yes/No -> Yes
     if re.search(r"proficiency in english|english (proficiency|level)|level of english", ql) and kind in ("select", "radio"):
         return pick(r"^professional")
@@ -196,6 +417,8 @@ def answer(q, kind, opts=()):
         return PHONE or None
     if re.search(r"how many years|years of (work )?experience|experience (do you have|in years)|(total|relevant|work) (work )?experience"
                  r"|experience\W*\(?in years", ql):
+        if not blanket and re.search(r"experience\s+(do you have\s+)?(in|with|using|of|on)\s+(?!years?\b|total\b)\w", ql):
+            return None  # "experience in Revit" is a skill question -> Gemini, not a flat 1
         if kind in ("select", "radio"):
             return pick(r"(?<![\d.])1(?![\d.])") or pick(r"0\s*-\s*[12]|less than 2|1\s*-\s*[23]")
         return "1"
@@ -226,8 +449,8 @@ def log_job(job, status, query):
 
 
 def log_question(job, field):
-    _append(UNANSWERED_LOG, ["question", "kind", "options", "job_id", "job_title", "time"],
-            [field["q"], field["kind"], " | ".join(field.get("opts") or []), job["id"], job["title"], time.strftime("%Y-%m-%d %H:%M:%S")])
+    bank_record(field["q"], field["kind"], field.get("opts") or [], "LinkedIn",
+                f"https://www.linkedin.com/jobs/view/{job['id']}/")
 
 
 # Skills live inside the description under headings like "Skills Required" / "Qualifications" / "Requirements".
@@ -430,7 +653,8 @@ def pick_resume(page, job):
 
 
 def fill_page(page, job):
-    """Fill the current Easy Apply step. Returns the first field we can't answer, or None."""
+    """Fill the current Easy Apply step. Returns the fields we can't answer (all of them, so they reach the bank together)."""
+    unknown = []
     for f in page.evaluate(FIELDS_JS) or []:
         el = page.locator(f'[data-bot="{f.get("id", "")}"]')
         if f["kind"] == "checkbox":
@@ -441,11 +665,11 @@ def fill_page(page, job):
             continue
         if f["filled"]:
             continue
-        a = answer(f["q"], f["kind"], f.get("opts") or [])
+        a = smart_answer(f["q"], f["kind"], f.get("opts") or [], job)
         if a is None:
-            if not f["required"] and f["kind"] != "radio":
-                continue  # optional and unknown -> leave blank
-            return f
+            if f["required"] or f["kind"] == "radio":
+                unknown.append(f)
+            continue  # optional and unknown -> leave blank
         if f["kind"] == "radio":
             rid = f["ids"][f["opts"].index(a)]
             radio = page.locator(f'[data-bot="{rid}"]')
@@ -469,7 +693,7 @@ def fill_page(page, job):
         else:
             human_type(page, el, a)
         sr.pause(0.4, 1.2)
-    return None
+    return unknown
 
 
 def discard(page):
@@ -562,6 +786,7 @@ def read_job(page):
 
 def apply_open_job(page, job, dry_run):
     """Job is selected in the search page. Returns a status string."""
+    job.update(desc=job_description(page), site="LinkedIn", url=f"https://www.linkedin.com/jobs/view/{job['id']}/")  # Gemini context
     # the card said Easy Apply, so wait for the pane to load the button instead of checking once
     # LinkedIn serves this as a <button> or an <a>, depending on the build
     btn = page.locator(':is(button, a)[aria-label="Easy Apply to this job"]:visible, :is(button, a)[aria-label^="Continue applying"]:visible').first
@@ -591,9 +816,10 @@ def apply_open_job(page, job, dry_run):
             discard(page)
             return "resume_missing"
         unknown = fill_page(page, job)
+        for u in unknown:
+            log_question(job, u)
+            print(f"      unknown question: {u['q'][:100]!r} ({u['kind']})")
         if unknown:
-            log_question(job, unknown)
-            print(f"      unknown question: {unknown['q'][:100]!r} ({unknown['kind']})")
             discard(page)
             return "unknown_question"
         dlg = page.locator("dialog[open]")

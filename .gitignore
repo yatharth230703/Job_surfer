@@ -23,3 +23,6 @@ debug/
 # notes and research docs (not code)
 *.md
 *.txt
+
+# question bank write lock
+*.lock

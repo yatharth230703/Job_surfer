@@ -32,11 +32,8 @@ import apply_jobs as li  # noqa: E402  SEARCH_QUERIES, title_matches, answer, NC
 
 sr.LOCAL_DATA = HERE / "chrome_data"  # Naukri's own profile copy, separate from LinkedIn's
 APPLIED_LOG = HERE / "applied_log.csv"
-UNANSWERED_LOG = HERE / "unanswered_questions.csv"
 RETRY_STATUSES = ("error", "timeout", "no_button", "unclear", "not_applied")
-GENDER = li.env("GENDER")  # e.g. Female; unset -> gender questions are left unanswered
 DAILY_LIMIT = re.compile(r"daily (apply )?(limit|quota)|reached (the|your) (daily )?(apply|application) limit", re.I)
-CREDENTIAL = re.compile(r"certifi|licen[cs]|registered (with|pharmacist|nurse)|membership|member id", re.I)
 SUCCESS = re.compile(r"successfully applied", re.I)
 DRAWER = ".chatbot_Drawer"
 
@@ -116,14 +113,14 @@ def chat_options(page, kind):
     return opts
 
 
-def answer(q, kind, opts=()):
+def answer(q, kind, opts=(), job=None):
+    """Bank -> rules -> Gemini on first sight (li.smart_answer). Gender is never guessed: answer it in the bank."""
+    banked = li.bank_answer(q, opts)
+    if banked is not None:
+        return banked
     if re.search(r"\bgender\b", q, re.I):
-        if not GENDER:
-            return None
-        return next((o for o in opts if o.lower() == GENDER.lower()), None) if kind == "radio" else GENDER
-    if kind == "radio" and CREDENTIAL.search(q):
-        return None  # "Are you CPC certified?" -> never claim a credential she may not have
-    return li.answer(q, kind, opts)
+        return None
+    return li.smart_answer(q, kind, opts, job)
 
 
 def answer_chat(page, job):
@@ -144,20 +141,20 @@ def answer_chat(page, job):
         text = page.locator(f"{DRAWER} .textArea[contenteditable]")
         if radios or checks:
             opts = radios or checks
-            a = answer(q, "radio", [o for o, _ in opts])
+            a = answer(q, "radio", [o for o, _ in opts], job)
             target = next((loc for o, loc in opts if o == a), None)
         elif chips.count():
             opts = [chips.nth(i).inner_text().strip() for i in range(chips.count())]
-            a = answer(q, "radio", opts)
+            a = answer(q, "radio", opts, job)
             target = chips.nth(opts.index(a)) if a in opts else None
         elif text.count() and text.first.is_visible():
-            a = answer(q, "text")
+            a = answer(q, "text", (), job)
             target, is_text = text.first, True
         else:
             return f"unknown input for {q[:60]!r}"
         if target is None or a is None:
-            _append(UNANSWERED_LOG, ["question", "options", "job_url", "time"],
-                    [q, " | ".join(o for o, _ in (radios or checks)), job["url"], time.strftime("%Y-%m-%d %H:%M:%S")])
+            li.bank_record(q, "choice" if (radios or checks or chips.count()) else "text",
+                           [o for o, _ in (radios or checks)] or (opts if chips.count() else []), "Naukri", job["url"])
             return f"can't answer {q[:60]!r}"
         print(f"     Q {q[:70]!r} -> {a!r}")
         sr.human_click(page, target)
@@ -203,6 +200,8 @@ def apply_job(page, job, dry_run):
     if not btn:
         return "no_button"
     sr.read_profile(page)  # skim the description
+    body = page.evaluate("document.body.innerText")
+    job.update(site="Naukri", desc=body[body.find("Job description"):][:6000] if "Job description" in body else body[:6000])
     if dry_run:
         sr.wheel_into_view(page, btn)
         box = btn.bounding_box()
@@ -246,6 +245,7 @@ def main():
     ap.add_argument("--max-delay", type=float, default=120)
     ap.add_argument("--dry-run", action="store_true", help="find jobs and hover Apply, never click it")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--ai", action="store_true", help="with --selftest: also check live Gemini answers")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
@@ -314,6 +314,29 @@ def main():
             ctx.close()
 
 
+def bank_selftest():
+    """question_bank.xlsx round trip on a temp copy: record -> fill answer -> answered (and matched to options)."""
+    import tempfile
+    from openpyxl import load_workbook
+    real = li.QUESTION_BANK
+    li.QUESTION_BANK = Path(tempfile.mkdtemp()) / "bank.xlsx"
+    try:
+        q = "Are you CPC certified?*"
+        assert answer(q, "radio", ["Yes", "No"]) is None
+        li.bank_record(q, "radio", ["Yes", "No"], "Naukri", "u1")
+        li.bank_record("are you CPC  certified ?", "radio", ["Yes", "No"], "LinkedIn", "u2")  # same question
+        wb = load_workbook(li.QUESTION_BANK); ws = wb.active
+        assert ws.max_row == 2 and ws.cell(2, 6).value == 2 and ws.cell(2, 4).value == "Yes | No"
+        ws.cell(2, 2).value = "no"
+        wb.save(li.QUESTION_BANK)
+        assert answer("Are you CPC certified?", "radio", ["Yes", "No"]) == "No"  # bank beats the credential rule
+        assert answer("Are you CPC certified?", "text") == "no"
+        assert answer("Are you CPC certified?", "radio", ["Certified", "Not yet"]) is None  # doesn't fit options
+    finally:
+        li.QUESTION_BANK = real
+        li._bank["mtime"] = None
+
+
 def selftest():
     assert search_url("Founder's Office", "ncr", 7) == ("https://www.naukri.com/founder-s-office-jobs-in-delhi-ncr"
                                                         "?k=Founder%27s%20Office&l=delhi%20ncr&experience=1&jobAge=7")
@@ -322,10 +345,35 @@ def selftest():
     assert not location_ok("Bengaluru", "ncr") and not location_ok("Gurugram", "remote")
     assert answer("Are you CPC certified?", "radio", ["Yes", "No"]) is None
     assert answer("Do you hold a valid drug license?", "radio", ["Yes", "No"]) is None
-    assert answer("Are you comfortable with field sales?", "radio", ["Yes", "No"]) == "Yes"
+    assert answer("Are you comfortable with field sales?", "radio", ["Yes", "No"]) is None  # no job -> no Gemini, no blanket Yes
     assert answer("What is your gender identity?", "radio", ["Male", "Female"]) in (None, "Male", "Female")
+    bank_selftest()
     assert li.answer("How much experience do you have in Business Development?", "text") == "1"
-    assert li.answer("Are you comfortable with field work?", "radio", ["Yes", "No"]) == "Yes"
+    assert li.answer("Are you comfortable with field work?", "radio", ["Yes", "No"]) == "Yes"  # Wellfound keeps the blanket rule
+    assert li.answer("How many years of experience do you have in Revit?", "text", blanket=False) is None
+    assert li.answer("What is your total work experience? (in years)*", "text", blanket=False) == "1"
+    assert li.CREDENTIAL.search("Are you CPC certified?")
+    assert li.smart_answer("Are you comfortable with a minimal commitment fee (fully refunded with your first stipend)?",
+                           "radio", ["Yes", "No"], {"title": "x"}) is None  # never reaches Gemini
+    assert li.FEE.search("Are you ready to pay a registration fee of Rs 999?") and li.FEE.search("security deposit")
+    assert not li.FEE.search("Are you comfortable with a performance-based stipend?")
+    if "--ai" in sys.argv:  # live Gemini check (uses the API): honest No, flexible Yes, null for gender/ID
+        job = {"title": "Medical Billing Specialist", "company": "Knight Neurology", "site": "test", "url": "",
+               "desc": "Remote medical billing role. CPC certification preferred. Night shift (US hours)."}
+        real = li.QUESTION_BANK
+        li.QUESTION_BANK = Path(__import__("tempfile").mkdtemp()) / "bank.xlsx"
+        try:
+            assert li.ai_answer("Are you CPC certified?", "radio", ["Yes", "No"], job) == "No"
+            assert li.ai_answer("Do you have a degree in architecture?", "radio", ["Yes", "No"], job) == "No"
+            assert li.ai_answer("Are you comfortable working night shifts?", "radio", ["Yes", "No"], job) == "Yes"
+            assert li.ai_answer("How many years of experience do you have in Revit?", "text", (), job) == "0"
+            assert li.ai_answer("What is CPC AAPC Member ID to validate CPC?", "text", (), job) is None
+            sales = {"title": "Business Development Executive", "company": "Walk-In", "site": "test", "url": "",
+                     "desc": "We sell EdTech subscriptions to schools. Field sales role."}
+            print("what do you sell ->", li.ai_answer("What do you sell?", "text", (), sales))
+            print(li.ai_answer("In 50-100 words: why do you want to work in medical billing at our company?", "text", (), job))
+        finally:
+            li.QUESTION_BANK = real
     assert DAILY_LIMIT.search("You have reached your daily apply limit") and SUCCESS.search("You have successfully applied to")
     print("selftest ok")
 
